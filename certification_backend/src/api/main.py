@@ -535,9 +535,11 @@ async def orchestrate_attempt_db(
 
 
 async def maybe_notify(notification: Optional["NotificationTarget"], attempt_obj) -> None:
-    """Send optional notifications. MVP: webhook only; email is a no-op."""
+    """Send optional notifications. Supports webhook and email (SMTP/SendGrid/Mailgun) if configured via env."""
     if not notification:
         return
+
+    # Webhook notification
     url = notification.notification_url if isinstance(notification, NotificationTarget) else getattr(notification, "notification_url", None)
     if url:
         try:
@@ -553,6 +555,32 @@ async def maybe_notify(notification: Optional["NotificationTarget"], attempt_obj
             async with httpx.AsyncClient(timeout=5.0) as client:
                 await client.post(str(url), json=payload)
         except Exception:
+            # Best-effort; do not raise
+            pass
+
+    # Email notification
+    email = notification.notification_email if isinstance(notification, NotificationTarget) else getattr(notification, "notification_email", None)
+    if email:
+        try:
+            # Lazy import to avoid mandatory dependency during runtime if unused
+            from .notifications import (
+                EmailConfig,
+                EmailSender,
+                format_attempt_email_subject,
+                format_attempt_email_body,
+                format_attempt_email_body_html,
+            )
+            cfg = EmailConfig.from_env()
+            sender = EmailSender(cfg)
+            subject = format_attempt_email_subject(status=attempt_obj.status, run_id=attempt_obj.run_id, attempt_id=attempt_obj.attempt_id)
+            body_text = format_attempt_email_body(attempt_obj)
+            body_html = format_attempt_email_body_html(attempt_obj)
+            # Send synchronously in this async context (smtplib/httpx are blocking here)
+            # For production, consider using a background task or thread executor.
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, sender.send_email, email, subject, body_text, body_html)
+        except Exception:
+            # best-effort; ignore failures
             pass
 
 
