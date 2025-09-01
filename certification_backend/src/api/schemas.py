@@ -37,6 +37,8 @@ class RunStatus(BaseModel):
     correlation_key: Optional[str] = None
     branch: Optional[str] = None
     target_env: Optional[str] = None
+    # Generalized grouping of certification families for forward compatibility.
+    # Values are normalized to: code_quality, security, functional_test, e2e, performance, soak
     certification_types: List[str] = Field(default_factory=list)
     created_at: datetime
     last_updated: datetime
@@ -71,15 +73,57 @@ class NotificationTarget(BaseModel):
     )
 
 
+# Generalized certification selection with tool-specific option
+GeneralizedType = Literal["code_quality", "security", "functional_test", "e2e", "performance", "soak"]
+CodeQualityTool = Literal["pylint"]  # extensible in future
+SecurityTool = Literal["bandit"]     # extensible in future
+FunctionalTestTool = Literal["pytest"]  # extensible in future
+
+class CertificationSelection(BaseModel):
+    """Select a generalized certification type with optional per-tool selection."""
+    type: GeneralizedType = Field(..., description="Generalized certification type")
+    tool: Optional[str] = Field(
+        None,
+        description="Optional specific tool name within the generalized type (e.g., pylint | bandit | pytest).",
+    )
+
+
+def _normalize_legacy_types(values: List[str]) -> List[CertificationSelection]:
+    """Normalize legacy certification_types array into new generalized schema selections."""
+    normalized: List[CertificationSelection] = []
+    for v in values:
+        v_lower = v.lower()
+        if v_lower == "pylint":
+            normalized.append(CertificationSelection(type="code_quality", tool="pylint"))
+        elif v_lower == "bandit":
+            normalized.append(CertificationSelection(type="security", tool="bandit"))
+        elif v_lower == "pytest":
+            normalized.append(CertificationSelection(type="functional_test", tool="pytest"))
+        elif v_lower in {"e2e", "performance", "soak"}:
+            normalized.append(CertificationSelection(type=v_lower))
+        else:
+            # Unknown legacy value; keep as-is under type field to avoid hard failure
+            normalized.append(CertificationSelection(type=v_lower))  # type: ignore[arg-type]
+    return normalized
+
+
 class CreateRunRequest(BaseModel):
     correlation_key: Optional[str] = Field(
         None, description="Idempotency key to deduplicate run creation."
     )
     branch: Optional[str] = Field(None, description="SCM branch for mapping.")
     target_env: Optional[str] = Field(None, description="Target environment.")
-    certification_types: List[
-        Literal["pylint", "bandit", "pytest", "e2e", "performance", "soak"]
-    ] = Field(..., description="Types of certifications to execute.")
+    # New extensible input: either selections or legacy list still accepted via 'legacy_certification_types'
+    certification_selections: Optional[List[CertificationSelection]] = Field(
+        None,
+        description="Generalized certification selections with optional tool per type.",
+    )
+    legacy_certification_types: Optional[
+        List[Literal["pylint", "bandit", "pytest", "e2e", "performance", "soak"]]
+    ] = Field(
+        None,
+        description="Deprecated: legacy specific types. Prefer certification_selections."
+    )
     async_execution: bool = Field(
         True, description="Return immediately and allow polling for status."
     )
@@ -89,6 +133,14 @@ class CreateRunRequest(BaseModel):
     extra: Dict[str, Union[str, int, float, bool]] = Field(
         default_factory=dict, description="Additional parameters."
     )
+
+    # PUBLIC_INTERFACE
+    def effective_selections(self) -> List[CertificationSelection]:
+        """Return normalized list of certification selections regardless of legacy or new input."""
+        if self.certification_selections and len(self.certification_selections) > 0:
+            return self.certification_selections
+        legacy = self.legacy_certification_types or []
+        return _normalize_legacy_types(legacy)
 
 
 class CreateRunResponse(BaseModel):
@@ -101,12 +153,27 @@ class CreateAttemptRequest(BaseModel):
     correlation_key: Optional[str] = Field(
         None, description="Idempotency key to deduplicate attempt creation."
     )
-    certification_types: List[
-        Literal["pylint", "bandit", "pytest", "e2e", "performance", "soak"]
-    ] = Field(..., description="Types of certifications to execute for this attempt.")
+    certification_selections: Optional[List[CertificationSelection]] = Field(
+        None,
+        description="Generalized certification selections with optional tool per type."
+    )
+    legacy_certification_types: Optional[
+        List[Literal["pylint", "bandit", "pytest", "e2e", "performance", "soak"]]
+    ] = Field(
+        None,
+        description="Deprecated: legacy specific types. Prefer certification_selections."
+    )
     async_execution: bool = True
     notification: Optional[NotificationTarget] = None
     extra: Dict[str, Union[str, int, float, bool]] = Field(default_factory=dict)
+
+    # PUBLIC_INTERFACE
+    def effective_selections(self) -> List[CertificationSelection]:
+        """Return normalized list of certification selections regardless of legacy or new input."""
+        if self.certification_selections and len(self.certification_selections) > 0:
+            return self.certification_selections
+        legacy = self.legacy_certification_types or []
+        return _normalize_legacy_types(legacy)
 
 
 class PageMeta(BaseModel):

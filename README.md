@@ -2,42 +2,43 @@
 
 ## Metrics and Scoring
 
-The backend parses results from each certification type and records per-stage metrics and an overall score in AttemptStatus.metrics:
+The backend parses results from each certification family and records per-stage metrics in AttemptStatus.metrics under a generalized structure, enabling forward-compatible tool additions.
 
-- For pytest: parses junit.xml to compute passed, failed, skipped, errors, and score (percent passed ignoring skipped).
-- For pylint: extracts the "rated at X/10" score when present (scaled to 0–100). Heuristic fallback counts error/fatal markers.
-- For bandit: counts issues (0 issues = score 100, otherwise 0) with JSON fallback if available.
-- For Airflow-driven stages (e2e, performance, soak): reads the stage log JSON and sets score 100 if final state=success, else 0.
+Generalized families and default tools:
+- code_quality: tool=pylint (extensible: add flake8, ruff, etc. in future)
+- security: tool=bandit (extensible: add safety, semgrep, etc. in future)
+- functional_test: tool=pytest (extensible: add nose, unittest, robot, etc.)
+- airflow-dispatched: e2e, performance, soak
 
-AttemptStatus.metrics structure:
+Metrics are nested by generalized type and include per-tool entries when applicable:
+
+AttemptStatus.metrics example:
 {
   "stages": {
-    "pytest": { "passed": 10, "failed": 2, "skipped": 1, "errors": 0, "score": 83.33 },
-    "pylint": { "passed": 1, "failed": 0, "score": 90.0 },
-    "bandit": { "passed": 1, "failed": 0, "score": 100.0 },
-    "e2e": { "passed": 1, "failed": 0, "score": 100.0 }
-  },
-  "overall_score": 93.33
+    "functional_test": { "pytest": { "passed": 10, "failed": 2, "skipped": 1, "errors": 0, "score": 83.33 }, "score": 83.33 },
+    "code_quality":   { "pylint": { "passed": 1, "failed": 0, "score": 90.0 }, "score": 90.0 },
+    "security":       { "bandit": { "passed": 1, "failed": 0, "score": 100.0 }, "score": 100.0 },
+    "e2e":            { "passed": 1, "failed": 0, "score": 100.0 }
+  }
 }
 
 Notes:
 - If a stage does not produce a parsable report, its score may be null.
-- overall_score is the mean of available stage scores (ignores missing/null).
+- Tools are extensible. Additional tools under code_quality/security/functional_test can be added without changing the schema.
 
-Sample AttemptStatus response (excerpt):
-{
-  "attempt_id": "abc123",
-  "run_id": "run1",
-  "status": "succeeded",
-  "metrics": {
-    "stages": {
-      "pytest": { "passed": 20, "failed": 0, "skipped": 2, "errors": 0, "score": 100.0 },
-      "pylint": { "passed": 1, "failed": 0, "score": 92.5 },
-      "bandit": { "passed": 1, "failed": 0, "score": 100.0 }
-    },
-    "overall_score": 97.5
-  }
-}
+Legacy compatibility:
+- Requests may still provide legacy certification types ["pylint","bandit","pytest","e2e","performance","soak"].
+- The backend normalizes them to generalized selections internally.
+
+## Requesting Certifications
+
+Preferred (generalized) input:
+- CreateRunRequest.certification_selections: [{ "type": "code_quality", "tool": "pylint" }, { "type": "functional_test", "tool": "pytest" }]
+- CreateAttemptRequest.certification_selections: same structure
+
+Legacy (deprecated but supported):
+- CreateRunRequest.legacy_certification_types: ["pylint","pytest"]
+- CreateAttemptRequest.legacy_certification_types: ["bandit"]
 
 ## Airflow Integration
 The certification_backend can integrate with a real Airflow REST API for executing long-running jobs (e2e, performance, soak). Configure via environment variables (do not hardcode):
@@ -56,7 +57,7 @@ DAGs expected: cert_e2e, cert_performance, cert_soak
 Each DAG should accept a conf payload with "attempt_id".
 
 ## Email Notifications
-The service can send email notifications when attempt status changes (e.g., to PASSED/SUCCEEDED or FAILED). Email notifications are triggered when a `notification.notification_email` is provided in the CreateRun or CreateAttempt payload and email is configured via environment variables.
+The service can send email notifications when attempt status changes. Email notifications are triggered when a `notification.notification_email` is provided and email is configured via environment variables.
 
 Environment variables (do not hardcode):
 

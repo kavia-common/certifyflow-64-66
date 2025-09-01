@@ -38,6 +38,7 @@ from .schemas import (
     PageMeta,
     ListAttemptsResponse,
     APIError,
+    CertificationSelection,
 )
 from .result_parsers import (
     parse_pytest_junit,
@@ -61,11 +62,12 @@ def get_app() -> FastAPI:
     """Factory to create FastAPI app with routes and settings."""
     app = FastAPI(
         title="Certification Orchestration API",
-        version="0.2.0",
+        version="0.3.0",
         description=(
-            "Service to orchestrate certification runs (code quality, security, tests, e2e, performance, soak). "
-            "Local runner supports pylint, bandit, pytest. Long-running suites dispatched via Airflow or stub. "
-            "Asynchronous trigger with polling and optional notification callbacks. Webhooks can be HMAC signed."
+            "Service to orchestrate certification runs (code quality, security, functional tests, e2e, performance, soak). "
+            "Local runner supports generalized types with per-tool selection (e.g., pylint, bandit, pytest). "
+            "Long-running suites dispatched via Airflow or stub. Asynchronous trigger with polling and optional notification callbacks. "
+            "Webhooks can be HMAC signed."
         ),
         openapi_tags=[
             {"name": "health", "description": "Service health and metadata"},
@@ -139,12 +141,15 @@ def get_app() -> FastAPI:
                 return CreateRunResponse(run=existing_run, polling_url=polling_url, message="Run already exists (idempotent).")
 
             now = datetime.now(timezone.utc)
+            selections = payload.effective_selections()
+            # Store generalized types on run for summary visibility
+            generalized_types = sorted({sel.type for sel in selections})
             run = RunModel(
                 run_id=__import__("uuid").uuid4().hex,
                 correlation_key=payload.correlation_key,
                 branch=payload.branch,
                 target_env=payload.target_env,
-                certification_types=list(payload.certification_types),
+                certification_types=list(generalized_types),
                 created_at=now,
                 last_updated=now,
                 status="queued",
@@ -155,19 +160,20 @@ def get_app() -> FastAPI:
             attempt = repo_create_attempt(
                 session=session,
                 run_id=persisted.run_id,
-                types=payload.certification_types,
+                types=[f"{sel.type}:{sel.tool}" if sel.tool else sel.type for sel in selections],
                 correlation_key=payload.correlation_key,
             )
 
         # Set executor and orchestrate outside transaction
-        attempt.executor = resolve_executor(payload.certification_types)
+        selections = payload.effective_selections()
+        attempt.executor = resolve_executor([sel.type for sel in selections])
 
         if payload.async_execution:
             assert background_tasks is not None
             background_tasks.add_task(
                 orchestrate_attempt_db,
                 attempt.attempt_id,
-                payload.certification_types,
+                selections,
                 local_runner,
                 airflow,
                 payload.notification,
@@ -175,7 +181,7 @@ def get_app() -> FastAPI:
         else:
             await orchestrate_attempt_db(
                 attempt.attempt_id,
-                payload.certification_types,
+                selections,
                 local_runner,
                 airflow,
                 payload.notification,
@@ -237,6 +243,7 @@ def get_app() -> FastAPI:
         background_tasks: BackgroundTasks = None,
     ) -> AttemptStatus:
         """Create a new attempt for the given run and schedule execution."""
+        selections = payload.effective_selections()
         with session_scope() as session:
             run = repo_get_run(session, run_id)
             if not run:
@@ -246,19 +253,19 @@ def get_app() -> FastAPI:
             attempt = repo_create_attempt(
                 session=session,
                 run_id=run_id,
-                types=payload.certification_types,
+                types=[f"{sel.type}:{sel.tool}" if sel.tool else sel.type for sel in selections],
                 correlation_key=payload.correlation_key,
             )
 
         # Choose executor and orchestrate
-        attempt.executor = resolve_executor(payload.certification_types)
+        attempt.executor = resolve_executor([sel.type for sel in selections])
 
         if payload.async_execution:
             assert background_tasks is not None
             background_tasks.add_task(
                 orchestrate_attempt_db,
                 attempt.attempt_id,
-                payload.certification_types,
+                selections,
                 local_runner,
                 airflow,
                 payload.notification,
@@ -266,7 +273,7 @@ def get_app() -> FastAPI:
         else:
             await orchestrate_attempt_db(
                 attempt.attempt_id,
-                payload.certification_types,
+                selections,
                 local_runner,
                 airflow,
                 payload.notification,
@@ -457,12 +464,15 @@ def resolve_executor(types: List[str]) -> Literal["local", "airflow"]:
 
 async def orchestrate_attempt_db(
     attempt_id: str,
-    types: List[str],
+    selections: List["CertificationSelection"],
     local_runner: LocalRunner,
     airflow: AirflowClientStub,
     notification: Optional["NotificationTarget"],
 ):
-    """Core orchestration using database persistence for attempt status and assets."""
+    """Core orchestration using database persistence for attempt status and assets.
+
+    selections: list of generalized types with optional tool names.
+    """
     # mark running
     with session_scope() as session:
         # Fetch directly to get run_id for status updates
@@ -515,66 +525,96 @@ async def orchestrate_attempt_db(
 
     assets: List[Dict] = []
     messages: List[str] = []
-    stage_metrics: Dict[str, Dict[str, Optional[float]]] = {}
-    attempt_metrics: Dict[str, Dict] = {}
+    # stage_metrics now organized by generalized type and tool sub-entries when applicable
+    # Example:
+    # {
+    #   "code_quality": { "pylint": {...}, "score": 92.5 },
+    #   "security": { "bandit": {...}, "score": 100.0 },
+    #   "functional_test": { "pytest": {...}, "score": 83.33 },
+    #   "e2e": {...}
+    # }
+    stage_metrics: Dict[str, Dict] = {}
 
     try:
-        # Local suite
-        local_types = [t for t in types if t in {"pylint", "bandit", "pytest"}]
-        rc_accum = []
-        for t in local_types:
-            if t == "pylint":
-                res = local_runner.run_pylint(attempt_id=attempt_id)
-                # parse pylint log
-                try:
-                    sc = parse_pylint_log(res.get("log"))
-                    stage_metrics["pylint"] = {
-                        "passed": sc.passed,
-                        "failed": sc.failed,
-                        "skipped": sc.skipped,
-                        "errors": sc.errors,
-                        "score": sc.score,
-                    }
-                except Exception:
-                    stage_metrics["pylint"] = {"score": None}
-            elif t == "bandit":
-                res = local_runner.run_bandit(attempt_id=attempt_id)
-                try:
-                    sc = parse_bandit_log(res.get("log"))
-                    stage_metrics["bandit"] = {
-                        "passed": sc.passed,
-                        "failed": sc.failed,
-                        "skipped": sc.skipped,
-                        "errors": sc.errors,
-                        "score": sc.score,
-                    }
-                except Exception:
-                    stage_metrics["bandit"] = {"score": None}
-            elif t == "pytest":
-                res = local_runner.run_pytest(attempt_id=attempt_id)
-                # parse junit if present
-                try:
-                    junit = res.get("junit")
-                    sc = parse_pytest_junit(junit) if junit else None
-                    if sc:
-                        stage_metrics["pytest"] = {
+        # Local suite based on generalized selections
+        rc_accum: List[Optional[int]] = []
+        local_items = [s for s in selections if s.type in {"code_quality", "security", "functional_test"}]
+        for sel in local_items:
+            t = sel.type
+            tool = (sel.tool or "").lower()
+
+            res = None
+            if t == "code_quality":
+                if tool in {"", "pylint"}:
+                    res = local_runner.run_pylint(attempt_id=attempt_id)
+                    try:
+                        sc = parse_pylint_log(res.get("log"))
+                        # ensure container exists
+                        stage_metrics.setdefault("code_quality", {})
+                        stage_metrics["code_quality"]["pylint"] = {
                             "passed": sc.passed,
                             "failed": sc.failed,
                             "skipped": sc.skipped,
                             "errors": sc.errors,
                             "score": sc.score,
                         }
-                except Exception:
-                    stage_metrics["pytest"] = {"score": None}
-            else:
-                continue
-            produced = [maybe_upload(a) for a in res.get("assets", [])]
-            assets.extend(produced)
-            messages.append(f"{t} rc={res.get('rc')}")
-            rc_accum.append(res.get("rc"))
+                        stage_metrics["code_quality"]["score"] = sc.score
+                    except Exception:
+                        stage_metrics.setdefault("code_quality", {})
+                        stage_metrics["code_quality"]["pylint"] = {"score": None}
+                else:
+                    messages.append(f"code_quality tool={tool} not supported")
+            elif t == "security":
+                if tool in {"", "bandit"}:
+                    res = local_runner.run_bandit(attempt_id=attempt_id)
+                    try:
+                        sc = parse_bandit_log(res.get("log"))
+                        stage_metrics.setdefault("security", {})
+                        stage_metrics["security"]["bandit"] = {
+                            "passed": sc.passed,
+                            "failed": sc.failed,
+                            "skipped": sc.skipped,
+                            "errors": sc.errors,
+                            "score": sc.score,
+                        }
+                        stage_metrics["security"]["score"] = sc.score
+                    except Exception:
+                        stage_metrics.setdefault("security", {})
+                        stage_metrics["security"]["bandit"] = {"score": None}
+                else:
+                    messages.append(f"security tool={tool} not supported")
+            elif t == "functional_test":
+                if tool in {"", "pytest"}:
+                    res = local_runner.run_pytest(attempt_id=attempt_id)
+                    try:
+                        junit = res.get("junit")
+                        sc = parse_pytest_junit(junit) if junit else None
+                        stage_metrics.setdefault("functional_test", {})
+                        if sc:
+                            stage_metrics["functional_test"]["pytest"] = {
+                                "passed": sc.passed,
+                                "failed": sc.failed,
+                                "skipped": sc.skipped,
+                                "errors": sc.errors,
+                                "score": sc.score,
+                            }
+                            stage_metrics["functional_test"]["score"] = sc.score
+                        else:
+                            stage_metrics["functional_test"]["pytest"] = {"score": None}
+                    except Exception:
+                        stage_metrics.setdefault("functional_test", {})
+                        stage_metrics["functional_test"]["pytest"] = {"score": None}
+                else:
+                    messages.append(f"functional_test tool={tool} not supported")
+
+            if res:
+                produced = [maybe_upload(a) for a in res.get("assets", [])]
+                assets.extend(produced)
+                messages.append(f"{t}:{tool or 'default'} rc={res.get('rc')}")
+                rc_accum.append(res.get("rc"))
 
         # Airflow suite
-        airflow_types = [t for t in types if t in {"e2e", "performance", "soak"}]
+        airflow_types = [s.type for s in selections if s.type in {"e2e", "performance", "soak"}]
         for t in airflow_types:
             dag_id = f"cert_{t}"
             try:
@@ -643,9 +683,11 @@ async def orchestrate_attempt_db(
             from .models import Attempt as AttemptModel
             a_model2 = session.get(AttemptModel, attempt_id)
             if a_model2:
-                # Merge with any existing metrics dict
+                # Merge with any existing metrics dict and add our per-stage structure
                 m = dict(a_model2.metrics or {})
-                m.update(attempt_metrics)
+                m.update({
+                    "stages": stage_metrics
+                })
                 a_model2.metrics = m
                 session.flush()
             repo_update_attempt_status_and_assets(

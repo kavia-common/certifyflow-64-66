@@ -213,7 +213,8 @@ def create_attempt(
         started_at=None,
         finished_at=None,
         message=None,
-        metrics={"requested_types": ",".join(types)},
+        # Store requested selections as provided to help debugging and compatibility.
+        metrics={"requested": types},
         executor="local",
         correlation_key=correlation_key,
     )
