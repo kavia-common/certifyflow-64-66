@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
 from .models import Run, Attempt, Asset, NotificationSetting
@@ -158,10 +158,15 @@ def create_or_get_run(session: Session, run: Run, notification: Optional[Notific
 
 
 # PUBLIC_INTERFACE
-def list_runs(session: Session) -> List[RunStatus]:
-    """List all runs with their attempts and assets eagerly loaded."""
-    runs = session.execute(select(Run)).scalars().all()
-    return [_to_run_status(r) for r in runs]
+def list_runs(session: Session, page: Optional[int] = None, per_page: Optional[int] = None) -> Tuple[List[RunStatus], int]:
+    """List runs with optional pagination. Returns (runs, total)."""
+    stmt = select(Run).order_by(Run.created_at.desc())
+    total = session.execute(select(func.count()).select_from(Run)).scalar_one()
+    if page and per_page:
+        offset = (page - 1) * per_page
+        stmt = stmt.offset(offset).limit(per_page)
+    runs = session.execute(stmt).scalars().all()
+    return ([_to_run_status(r) for r in runs], total)
 
 
 # PUBLIC_INTERFACE
@@ -230,6 +235,18 @@ def get_attempt(session: Session, run_id: str, attempt_id: str) -> Optional[Atte
     if not a or a.run_id != run_id:
         return None
     return _to_attempt_status(a)
+
+
+# PUBLIC_INTERFACE
+def list_attempts(session: Session, run_id: str, page: Optional[int] = None, per_page: Optional[int] = None) -> Tuple[List[AttemptStatus], int]:
+    """List attempts for a run with optional pagination. Returns (attempts, total)."""
+    total = session.execute(select(func.count()).select_from(Attempt).where(Attempt.run_id == run_id)).scalar_one()
+    stmt = select(Attempt).where(Attempt.run_id == run_id).order_by(Attempt.started_at.nullsfirst(), Attempt.attempt_id)
+    if page and per_page:
+        offset = (page - 1) * per_page
+        stmt = stmt.offset(offset).limit(per_page)
+    items = session.execute(stmt).scalars().all()
+    return ([_to_attempt_status(a) for a in items], total)
 
 
 # PUBLIC_INTERFACE

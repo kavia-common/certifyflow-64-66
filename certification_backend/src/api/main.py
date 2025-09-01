@@ -1,4 +1,6 @@
 import asyncio
+import hmac
+import hashlib
 import json
 import os
 import subprocess
@@ -7,8 +9,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
-from fastapi import BackgroundTasks, Body, FastAPI, HTTPException, Path as FPath, Request, status
+from fastapi import BackgroundTasks, Body, FastAPI, HTTPException, Path as FPath, Request, status, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 # Switch to SQLAlchemy-backed repository
 from .db import session_scope, Base, engine
@@ -21,6 +24,7 @@ from .repository import (
     create_attempt as repo_create_attempt,
     get_attempt as repo_get_attempt,
     update_attempt_status_and_assets as repo_update_attempt_status_and_assets,
+    list_attempts as repo_list_attempts,
 )
 from .schemas import (
     CreateRunRequest,
@@ -31,6 +35,9 @@ from .schemas import (
     ListRunsResponse,
     NotificationTarget,
     AssetRef,
+    PageMeta,
+    ListAttemptsResponse,
+    APIError,
 )
 
 # Storage (optional import; will raise at runtime if misconfigured when first used)
@@ -40,16 +47,19 @@ except Exception:
     S3StorageService = None  # type: ignore
     StorageConfig = None  # type: ignore
 
+DEFAULT_PER_PAGE = 25
+MAX_PER_PAGE = 200
+
 # PUBLIC_INTERFACE
 def get_app() -> FastAPI:
     """Factory to create FastAPI app with routes and settings."""
     app = FastAPI(
         title="Certification Orchestration API",
-        version="0.1.0",
+        version="0.2.0",
         description=(
             "Service to orchestrate certification runs (code quality, security, tests, e2e, performance, soak). "
-            "Local runner supports pylint, bandit, pytest. Long-running suites dispatched via Airflow (stub). "
-            "Asynchronous trigger with polling and optional notification callbacks."
+            "Local runner supports pylint, bandit, pytest. Long-running suites dispatched via Airflow or stub. "
+            "Asynchronous trigger with polling and optional notification callbacks. Webhooks can be HMAC signed."
         ),
         openapi_tags=[
             {"name": "health", "description": "Service health and metadata"},
@@ -88,6 +98,17 @@ def get_app() -> FastAPI:
     def health_check():
         """Basic health check endpoint returning service status."""
         return {"message": "Healthy", "time": datetime.now(timezone.utc).isoformat()}
+
+    def api_error(code: str, message: str, status_code: int = 400, detail: Optional[Dict] = None) -> JSONResponse:
+        """Return standardized API error response."""
+        return JSONResponse(status_code=status_code, content=APIError(code=code, message=message, detail=detail or {}).model_dump())
+
+    def compute_pagination(page: Optional[int], per_page: Optional[int], total: int) -> Optional[PageMeta]:
+        if not page or not per_page:
+            return None
+        next_page = page + 1 if (page * per_page) < total else None
+        prev_page = page - 1 if page > 1 else None
+        return PageMeta(page=page, per_page=per_page, total=total, next_page=next_page, prev_page=prev_page)
 
     @app.post(
         "/runs",
@@ -164,14 +185,20 @@ def get_app() -> FastAPI:
         tags=["runs"],
         summary="List runs",
         response_model=ListRunsResponse,
-        description="Retrieve a list of all runs in the MVP in-memory store.",
+        description="Retrieve a list of runs with optional pagination.",
     )
     # PUBLIC_INTERFACE
-    def list_runs() -> ListRunsResponse:
-        """List all runs from the database."""
+    def list_runs(
+        page: Optional[int] = Query(default=None, ge=1, description="Page number (1-based)"),
+        per_page: Optional[int] = Query(default=None, ge=1, le=MAX_PER_PAGE, description="Items per page"),
+    ) -> ListRunsResponse:
+        """List runs from the database with optional pagination."""
         with session_scope() as session:
-            runs = repo_list_runs(session)
-            return ListRunsResponse(runs=runs)
+            if page and not per_page:
+                per_page = DEFAULT_PER_PAGE
+            runs, total = repo_list_runs(session, page=page, per_page=per_page)
+            meta = compute_pagination(page, per_page, total)
+            return ListRunsResponse(runs=runs, page=meta)
 
     @app.get(
         "/runs/{run_id}",
@@ -186,7 +213,7 @@ def get_app() -> FastAPI:
         with session_scope() as session:
             run = repo_get_run(session, run_id)
             if not run:
-                raise HTTPException(status_code=404, detail="Run not found")
+                raise HTTPException(status_code=404, detail=APIError(code="RUN_NOT_FOUND", message="Run not found").model_dump())
             return run
 
     @app.post(
@@ -207,7 +234,7 @@ def get_app() -> FastAPI:
         with session_scope() as session:
             run = repo_get_run(session, run_id)
             if not run:
-                raise HTTPException(status_code=404, detail="Run not found")
+                raise HTTPException(status_code=404, detail=APIError(code="RUN_NOT_FOUND", message="Run not found").model_dump())
 
             # Idempotency via correlation key
             attempt = repo_create_attempt(
@@ -245,6 +272,29 @@ def get_app() -> FastAPI:
             return fresh
 
     @app.get(
+        "/runs/{run_id}/attempts",
+        tags=["attempts"],
+        summary="List attempts for a run",
+        response_model=ListAttemptsResponse,
+        description="Retrieve attempts for a run with optional pagination.",
+    )
+    # PUBLIC_INTERFACE
+    def list_attempts_for_run(
+        run_id: str = FPath(..., description="Run id"),
+        page: Optional[int] = Query(default=None, ge=1, description="Page number (1-based)"),
+        per_page: Optional[int] = Query(default=None, ge=1, le=MAX_PER_PAGE, description="Items per page"),
+    ) -> ListAttemptsResponse:
+        """List attempts for a run with pagination."""
+        with session_scope() as session:
+            if not repo_get_run(session, run_id):
+                raise HTTPException(status_code=404, detail=APIError(code="RUN_NOT_FOUND", message="Run not found").model_dump())
+            if page and not per_page:
+                per_page = DEFAULT_PER_PAGE
+            attempts, total = repo_list_attempts(session, run_id=run_id, page=page, per_page=per_page)
+            meta = compute_pagination(page, per_page, total)
+            return ListAttemptsResponse(attempts=attempts, page=meta)
+
+    @app.get(
         "/runs/{run_id}/attempts/{attempt_id}",
         tags=["attempts"],
         summary="Get attempt status",
@@ -260,7 +310,7 @@ def get_app() -> FastAPI:
         with session_scope() as session:
             attempt = repo_get_attempt(session, run_id, attempt_id)
             if not attempt:
-                raise HTTPException(status_code=404, detail="Attempt not found")
+                raise HTTPException(status_code=404, detail=APIError(code="ATTEMPT_NOT_FOUND", message="Attempt not found").model_dump())
             return attempt
 
     # WebSocket usage help note (route)
@@ -276,6 +326,32 @@ def get_app() -> FastAPI:
         return {"message": "No WebSockets in MVP; use polling via GET /runs/{run_id} and GET /runs/{run_id}/attempts/{attempt_id}."}
 
     return app
+
+
+def verify_webhook_signature(secret: str, body: bytes, headers: Dict[str, str], tolerance_sec: int = 300) -> bool:
+    """Verify incoming webhook HMAC-SHA256 signature and timestamp.
+
+    Expected headers:
+      - X-Certifyflow-Signature
+      - X-Certifyflow-Algorithm (hmac-sha256)
+      - X-Certifyflow-Timestamp
+    """
+    try:
+        algo = headers.get("x-certifyflow-algorithm") or headers.get("X-Certifyflow-Algorithm")
+        if (algo or "").lower() != "hmac-sha256":
+            return False
+        sig = headers.get("x-certifyflow-signature") or headers.get("X-Certifyflow-Signature")
+        ts_s = headers.get("x-certifyflow-timestamp") or headers.get("X-Certifyflow-Timestamp")
+        if not sig or not ts_s:
+            return False
+        ts = int(ts_s)
+        now = int(datetime.now(timezone.utc).timestamp())
+        if abs(now - ts) > tolerance_sec:
+            return False
+        expected = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, sig)
+    except Exception:
+        return False
 
 
 # ==== Helpers, Runners, and Stubs (unchanged) ====
@@ -535,12 +611,28 @@ async def orchestrate_attempt_db(
 
 
 async def maybe_notify(notification: Optional["NotificationTarget"], attempt_obj) -> None:
-    """Send optional notifications. Supports webhook and email (SMTP/SendGrid/Mailgun) if configured via env."""
+    """Send optional notifications. Supports webhook and email (SMTP/SendGrid/Mailgun) if configured via env.
+
+    Webhooks are signed with HMAC-SHA256 when a secret is available, either from:
+      - notification.webhook_secret (preferred)
+      - WEBHOOK_DEFAULT_SECRET env var (fallback)
+    Headers included:
+      - X-Certifyflow-Signature: hex-encoded signature
+      - X-Certifyflow-Algorithm: hmac-sha256
+      - X-Certifyflow-Timestamp: epoch seconds as string
+    """
     if not notification:
         return
 
     # Webhook notification
     url = notification.notification_url if isinstance(notification, NotificationTarget) else getattr(notification, "notification_url", None)
+    secret = None
+    if isinstance(notification, NotificationTarget):
+        secret = notification.webhook_secret
+    if not secret:
+        # Optional fallback secret via environment (do not hardcode)
+        secret = os.getenv("WEBHOOK_DEFAULT_SECRET")
+
     if url:
         try:
             import httpx  # type: ignore
@@ -552,8 +644,16 @@ async def maybe_notify(notification: Optional["NotificationTarget"], attempt_obj
                 "assets": [a.model_dump() for a in getattr(attempt_obj, "assets", [])],
                 "finished_at": attempt_obj.finished_at.isoformat() if attempt_obj.finished_at else None,
             }
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post(str(url), json=payload)
+            headers: Dict[str, str] = {}
+            if secret:
+                ts = int(datetime.now(timezone.utc).timestamp())
+                body_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+                sig = hmac.new(secret.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
+                headers["X-Certifyflow-Signature"] = sig
+                headers["X-Certifyflow-Algorithm"] = "hmac-sha256"
+                headers["X-Certifyflow-Timestamp"] = str(ts)
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(str(url), json=payload, headers=headers)
         except Exception:
             # Best-effort; do not raise
             pass
