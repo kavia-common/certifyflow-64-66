@@ -39,6 +39,12 @@ from .schemas import (
     ListAttemptsResponse,
     APIError,
 )
+from .result_parsers import (
+    parse_pytest_junit,
+    parse_pylint_log,
+    parse_bandit_log,
+    parse_airflow_stage_log,
+)
 
 # Storage (optional import; will raise at runtime if misconfigured when first used)
 try:
@@ -509,6 +515,8 @@ async def orchestrate_attempt_db(
 
     assets: List[Dict] = []
     messages: List[str] = []
+    stage_metrics: Dict[str, Dict[str, Optional[float]]] = {}
+    attempt_metrics: Dict[str, Dict] = {}
 
     try:
         # Local suite
@@ -517,10 +525,47 @@ async def orchestrate_attempt_db(
         for t in local_types:
             if t == "pylint":
                 res = local_runner.run_pylint(attempt_id=attempt_id)
+                # parse pylint log
+                try:
+                    sc = parse_pylint_log(res.get("log"))
+                    stage_metrics["pylint"] = {
+                        "passed": sc.passed,
+                        "failed": sc.failed,
+                        "skipped": sc.skipped,
+                        "errors": sc.errors,
+                        "score": sc.score,
+                    }
+                except Exception:
+                    stage_metrics["pylint"] = {"score": None}
             elif t == "bandit":
                 res = local_runner.run_bandit(attempt_id=attempt_id)
+                try:
+                    sc = parse_bandit_log(res.get("log"))
+                    stage_metrics["bandit"] = {
+                        "passed": sc.passed,
+                        "failed": sc.failed,
+                        "skipped": sc.skipped,
+                        "errors": sc.errors,
+                        "score": sc.score,
+                    }
+                except Exception:
+                    stage_metrics["bandit"] = {"score": None}
             elif t == "pytest":
                 res = local_runner.run_pytest(attempt_id=attempt_id)
+                # parse junit if present
+                try:
+                    junit = res.get("junit")
+                    sc = parse_pytest_junit(junit) if junit else None
+                    if sc:
+                        stage_metrics["pytest"] = {
+                            "passed": sc.passed,
+                            "failed": sc.failed,
+                            "skipped": sc.skipped,
+                            "errors": sc.errors,
+                            "score": sc.score,
+                        }
+                except Exception:
+                    stage_metrics["pytest"] = {"score": None}
             else:
                 continue
             produced = [maybe_upload(a) for a in res.get("assets", [])]
@@ -571,6 +616,18 @@ async def orchestrate_attempt_db(
 
                 produced = [maybe_upload(a) for a in step_assets]
                 assets.extend(produced)
+                # Parse airflow stage log into metrics
+                try:
+                    sc = parse_airflow_stage_log(af_log, t)
+                    stage_metrics[t] = {
+                        "passed": sc.passed,
+                        "failed": sc.failed,
+                        "skipped": sc.skipped,
+                        "errors": sc.errors,
+                        "score": sc.score,
+                    }
+                except Exception:
+                    stage_metrics[t] = {"score": None}
                 messages.append(f"{t} state={str(complete.get('state') or complete.get('status') or '').lower()}")
             except Exception as af_exc:
                 messages.append(f"{t} state=failed error={af_exc}")
@@ -582,6 +639,15 @@ async def orchestrate_attempt_db(
         final_status = "failed" if (failed_rc or af_failed) else "succeeded"
 
         with session_scope() as session:
+            # attach metrics to attempt before converting to schema in repository layer
+            from .models import Attempt as AttemptModel
+            a_model2 = session.get(AttemptModel, attempt_id)
+            if a_model2:
+                # Merge with any existing metrics dict
+                m = dict(a_model2.metrics or {})
+                m.update(attempt_metrics)
+                a_model2.metrics = m
+                session.flush()
             repo_update_attempt_status_and_assets(
                 session=session,
                 attempt_id=attempt_id,

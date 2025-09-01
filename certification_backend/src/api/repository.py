@@ -270,6 +270,7 @@ def update_attempt_status_and_assets(
         a.finished_at = finished_at
     a.status = status
     a.message = message
+    # keep existing a.metrics, already set by orchestrator when available
 
     # Replace assets for attempt
     # First clear existing attempt assets

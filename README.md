@@ -1,5 +1,44 @@
 # certifyflow-64-66
 
+## Metrics and Scoring
+
+The backend parses results from each certification type and records per-stage metrics and an overall score in AttemptStatus.metrics:
+
+- For pytest: parses junit.xml to compute passed, failed, skipped, errors, and score (percent passed ignoring skipped).
+- For pylint: extracts the "rated at X/10" score when present (scaled to 0–100). Heuristic fallback counts error/fatal markers.
+- For bandit: counts issues (0 issues = score 100, otherwise 0) with JSON fallback if available.
+- For Airflow-driven stages (e2e, performance, soak): reads the stage log JSON and sets score 100 if final state=success, else 0.
+
+AttemptStatus.metrics structure:
+{
+  "stages": {
+    "pytest": { "passed": 10, "failed": 2, "skipped": 1, "errors": 0, "score": 83.33 },
+    "pylint": { "passed": 1, "failed": 0, "score": 90.0 },
+    "bandit": { "passed": 1, "failed": 0, "score": 100.0 },
+    "e2e": { "passed": 1, "failed": 0, "score": 100.0 }
+  },
+  "overall_score": 93.33
+}
+
+Notes:
+- If a stage does not produce a parsable report, its score may be null.
+- overall_score is the mean of available stage scores (ignores missing/null).
+
+Sample AttemptStatus response (excerpt):
+{
+  "attempt_id": "abc123",
+  "run_id": "run1",
+  "status": "succeeded",
+  "metrics": {
+    "stages": {
+      "pytest": { "passed": 20, "failed": 0, "skipped": 2, "errors": 0, "score": 100.0 },
+      "pylint": { "passed": 1, "failed": 0, "score": 92.5 },
+      "bandit": { "passed": 1, "failed": 0, "score": 100.0 }
+    },
+    "overall_score": 97.5
+  }
+}
+
 ## Airflow Integration
 The certification_backend can integrate with a real Airflow REST API for executing long-running jobs (e2e, performance, soak). Configure via environment variables (do not hardcode):
 
