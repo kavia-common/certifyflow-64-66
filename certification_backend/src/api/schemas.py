@@ -11,6 +11,12 @@ class AssetRef(BaseModel):
     path: str = Field(..., description="Local path or storage URI")
     content_type: Optional[str] = Field(None, description="MIME type if known")
     size_bytes: Optional[int] = Field(None, description="Size in bytes if known")
+    storage_key: Optional[str] = Field(
+        None, description="Object storage key if asset uploaded to S3/MinIO"
+    )
+    signed_url: Optional[HttpUrl] = Field(
+        None, description="Presigned URL for temporary access to the asset"
+    )
 
 
 class AttemptStatus(BaseModel):

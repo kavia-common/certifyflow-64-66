@@ -14,9 +14,75 @@ from .schemas import (
     NotificationTarget,
 )
 
+try:
+    # Lazy import to avoid hard failures in contexts where storage isn't configured
+    from .storage import S3StorageService, StorageConfig  # type: ignore
+except Exception:  # pragma: no cover - optional
+    S3StorageService = None  # type: ignore
+    StorageConfig = None  # type: ignore
+
+
+def _augment_with_signed_url(ref: AssetRef) -> AssetRef:
+    """
+    Enrich AssetRef with signed_url if storage_key can be derived and storage is configured.
+    Convention: if path starts with "s3://bucket/key" or is stored as "s3:bucket/key" or "obj://bucket/key",
+    we treat the portion after bucket as the storage key. Otherwise, if path resembles an object key we try to sign it.
+    """
+    if S3StorageService is None or StorageConfig is None:
+        return ref
+
+    # Determine storage key convention: prefer explicit storage_key on ref if already set
+    storage_key = getattr(ref, "storage_key", None)
+    bucket = None
+    path = ref.path or ""
+
+    # Parse common forms
+    lowered = path.lower()
+    if not storage_key:
+        if lowered.startswith("s3://") or lowered.startswith("obj://"):
+            try:
+                # s3://bucket/key...
+                _, rest = path.split("://", 1)
+                bucket, storage_key = rest.split("/", 1)
+            except Exception:
+                storage_key = None
+        elif lowered.startswith("s3:"):
+            try:
+                # s3:bucket/key...
+                _, rest = path.split(":", 1)
+                bucket, storage_key = rest.split("/", 1)
+            except Exception:
+                storage_key = None
+
+    try:
+        cfg = StorageConfig.from_env()  # may raise if not configured
+    except Exception:
+        # storage not configured; return as-is
+        return ref
+
+    # Only sign if bucket matches configured bucket (or bucket unspecified)
+    if storage_key:
+        if bucket and bucket != cfg.bucket:
+            return ref
+        # generate signed url
+        try:
+            svc = S3StorageService(cfg)
+            url = svc.generate_presigned_url(storage_key)
+            public_url = svc.object_url(storage_key)
+            if url or public_url:
+                # prefer signed if present, else public
+                ref.signed_url = url or public_url  # type: ignore[attr-defined]
+                ref.storage_key = storage_key  # type: ignore[attr-defined]
+        except Exception:
+            # best-effort
+            pass
+
+    return ref
+
 
 def _to_asset_ref(a: Asset) -> AssetRef:
-    return AssetRef(name=a.name, path=a.path, content_type=a.content_type, size_bytes=a.size_bytes)
+    ref = AssetRef(name=a.name, path=a.path, content_type=a.content_type, size_bytes=a.size_bytes)
+    return _augment_with_signed_url(ref)
 
 
 def _to_attempt_status(a: Attempt) -> AttemptStatus:

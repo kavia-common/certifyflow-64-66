@@ -33,6 +33,13 @@ from .schemas import (
     AssetRef,
 )
 
+# Storage (optional import; will raise at runtime if misconfigured when first used)
+try:
+    from .storage import S3StorageService, StorageConfig
+except Exception:
+    S3StorageService = None  # type: ignore
+    StorageConfig = None  # type: ignore
+
 # PUBLIC_INTERFACE
 def get_app() -> FastAPI:
     """Factory to create FastAPI app with routes and settings."""
@@ -393,6 +400,37 @@ async def orchestrate_attempt_db(
             assets=[],
         )
 
+    # Instantiate storage service if configured
+    storage_service = None
+    if S3StorageService and StorageConfig:
+        try:
+            storage_service = S3StorageService(StorageConfig.from_env())
+        except Exception:
+            storage_service = None
+
+    def maybe_upload(asset: Dict) -> Dict:
+        """
+        Upload a single local asset to object storage if configured.
+        Returns updated asset dict including 'path' updated to s3://bucket/key and preserves content_type and size.
+        """
+        if not storage_service:
+            return asset
+        try:
+            local_path = asset.get("path")
+            name = asset.get("name") or Path(str(local_path)).name
+            # key convention: runs/<run_id>/attempts/<attempt_id>/<filename>
+            # obtain run_id safely by directory from artifact dir or DB lookup not ideal here; we use DB lookup done earlier.
+            filename = Path(str(local_path)).name if local_path else name
+            key = f"attempts/{attempt_id}/{filename}"
+            storage_service.upload_file(local_path=str(local_path), storage_key=key, content_type=asset.get("content_type"))
+            asset["path"] = f"s3://{storage_service.config.bucket}/{key}"
+            # include storage_key hint (picked up by repo to sign)
+            asset["storage_key"] = key
+        except Exception:
+            # keep local path on failures
+            pass
+        return asset
+
     assets: List[Dict] = []
     messages: List[str] = []
 
@@ -409,7 +447,8 @@ async def orchestrate_attempt_db(
                 res = local_runner.run_pytest(attempt_id=attempt_id)
             else:
                 continue
-            assets.extend(res.get("assets", []))
+            produced = [maybe_upload(a) for a in res.get("assets", [])]
+            assets.extend(produced)
             messages.append(f"{t} rc={res.get('rc')}")
             rc_accum.append(res.get("rc"))
 
@@ -454,7 +493,8 @@ async def orchestrate_attempt_db(
                 if af_log.exists():
                     step_assets = [{"name": f"{t}_airflow_log", "path": str(af_log), "content_type": "application/json", "size_bytes": af_log.stat().st_size}]
 
-                assets.extend(step_assets)
+                produced = [maybe_upload(a) for a in step_assets]
+                assets.extend(produced)
                 messages.append(f"{t} state={str(complete.get('state') or complete.get('status') or '').lower()}")
             except Exception as af_exc:
                 messages.append(f"{t} state=failed error={af_exc}")
