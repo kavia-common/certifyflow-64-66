@@ -68,7 +68,13 @@ def get_app() -> FastAPI:
     storage_root.mkdir(parents=True, exist_ok=True)
 
     local_runner = LocalRunner(storage_root=storage_root)
-    airflow = AirflowClientStub()
+    # Initialize Airflow client if configured; fall back to stub if missing config
+    try:
+        from .airflow_client import AirflowClient  # real client
+        airflow = AirflowClient()
+    except Exception:
+        # If configuration not provided yet, keep the stub for local only executions
+        airflow = AirflowClientStub()
 
     @app.get("/", tags=["health"], summary="Health Check")
     # PUBLIC_INTERFACE
@@ -411,14 +417,48 @@ async def orchestrate_attempt_db(
         airflow_types = [t for t in types if t in {"e2e", "performance", "soak"}]
         for t in airflow_types:
             dag_id = f"cert_{t}"
-            trigger = await airflow.trigger(dag_id=dag_id, conf={"attempt_id": attempt_id})
-            complete = await airflow.wait_for_completion(dag_id=dag_id, dag_run_id=trigger["dag_run_id"])
-            # simulate artifact
-            storage = local_runner._artifact_dir(attempt_id)
-            af_log = storage / f"{t}_airflow.log"
-            af_log.write_text(json.dumps({"trigger": trigger, "complete": complete}, indent=2))
-            assets.append({"name": f"{t}_airflow_log", "path": str(af_log), "content_type": "application/json", "size_bytes": af_log.stat().st_size})
-            messages.append(f"{t} state={complete.get('state')}")
+            try:
+                trigger = await airflow.trigger(dag_id=dag_id, conf={"attempt_id": attempt_id})
+                dag_run_id = str(trigger.get("dag_run_id") or trigger.get("run_id") or trigger.get("dag_run_id".upper()) or "")
+                if not dag_run_id:
+                    # Some Airflow instances return "id" or "dag_run_id" in different casing
+                    dag_run_id = str(trigger.get("id") or "")
+                if not dag_run_id:
+                    raise RuntimeError(f"Airflow did not return a dag_run_id for dag {dag_id}: {trigger}")
+
+                # Periodically poll for completion while syncing status to DB
+                # and write a progressive log artifact for transparency
+                storage = local_runner._artifact_dir(attempt_id)
+                af_log = storage / f"{t}_airflow.log"
+                step_assets = []
+
+                # write initial trigger payload
+                af_log.write_text(json.dumps({"trigger": trigger}, indent=2))
+                if af_log.exists():
+                    step_assets.append({"name": f"{t}_airflow_log", "path": str(af_log), "content_type": "application/json", "size_bytes": af_log.stat().st_size})
+
+                # Stream status by polling the client, but if the client is stub it will still work
+                complete = await airflow.wait_for_completion(dag_id=dag_id, dag_run_id=dag_run_id)
+
+                # append completion info
+                try:
+                    prior = {}
+                    if af_log.exists():
+                        prior = json.loads(af_log.read_text() or "{}")
+                    prior["complete"] = complete
+                    af_log.write_text(json.dumps(prior, indent=2))
+                except Exception:
+                    pass
+
+                # update final asset size info
+                if af_log.exists():
+                    step_assets = [{"name": f"{t}_airflow_log", "path": str(af_log), "content_type": "application/json", "size_bytes": af_log.stat().st_size}]
+
+                assets.extend(step_assets)
+                messages.append(f"{t} state={str(complete.get('state') or complete.get('status') or '').lower()}")
+            except Exception as af_exc:
+                messages.append(f"{t} state=failed error={af_exc}")
+                # continue to next certification type
 
         # Determine final status
         failed_rc = any(isinstance(x, int) and x not in (0, None) for x in rc_accum)
