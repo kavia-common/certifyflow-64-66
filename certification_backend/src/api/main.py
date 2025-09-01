@@ -3,14 +3,35 @@ import json
 import os
 import subprocess
 import sys
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Union
+from typing import Dict, List, Literal, Optional
 
 from fastapi import BackgroundTasks, Body, FastAPI, HTTPException, Path as FPath, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, HttpUrl, EmailStr
+
+# Switch to SQLAlchemy-backed repository
+from .db import session_scope, Base, engine
+from .models import Run as RunModel
+from .repository import (
+    create_or_get_run as repo_create_or_get_run,
+    list_runs as repo_list_runs,
+    get_run as repo_get_run,
+    find_run_by_correlation_key as repo_find_run_by_correlation_key,
+    create_attempt as repo_create_attempt,
+    get_attempt as repo_get_attempt,
+    update_attempt_status_and_assets as repo_update_attempt_status_and_assets,
+)
+from .schemas import (
+    CreateRunRequest,
+    CreateRunResponse,
+    RunStatus,
+    AttemptStatus,
+    CreateAttemptRequest,
+    ListRunsResponse,
+    NotificationTarget,
+    AssetRef,
+)
 
 # PUBLIC_INTERFACE
 def get_app() -> FastAPI:
@@ -30,8 +51,8 @@ def get_app() -> FastAPI:
         ],
     )
 
-    # In-memory store for MVP
-    registry = TaskRegistry()
+    # Ensure tables exist (idempotent)
+    Base.metadata.create_all(bind=engine)
 
     # CORS
     app.add_middleware(
@@ -42,16 +63,6 @@ def get_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Routes
-
-    @app.get("/", tags=["health"], summary="Health Check")
-    # PUBLIC_INTERFACE
-    def health_check():
-        """Basic health check endpoint returning service status."""
-        return {"message": "Healthy", "time": datetime.now(timezone.utc).isoformat()}
-
-    # Models moved to module level
-
     # Services and helpers
     storage_root = Path(os.getenv("CERT_STORAGE_DIR", "data/storage")).resolve()
     storage_root.mkdir(parents=True, exist_ok=True)
@@ -59,7 +70,11 @@ def get_app() -> FastAPI:
     local_runner = LocalRunner(storage_root=storage_root)
     airflow = AirflowClientStub()
 
-    # Routes implementation
+    @app.get("/", tags=["health"], summary="Health Check")
+    # PUBLIC_INTERFACE
+    def health_check():
+        """Basic health check endpoint returning service status."""
+        return {"message": "Healthy", "time": datetime.now(timezone.utc).isoformat()}
 
     @app.post(
         "/runs",
@@ -76,57 +91,60 @@ def get_app() -> FastAPI:
         background_tasks: BackgroundTasks = None,
     ) -> CreateRunResponse:
         """Creates a run and triggers an initial attempt for the requested certification types."""
-        # Idempotent handling
-        existing_run = registry.find_run_by_correlation_key(payload.correlation_key) if payload.correlation_key else None
-        if existing_run:
-            polling_url = str(request.url_for("get_run_status", run_id=existing_run.run_id))
-            return CreateRunResponse(run=existing_run, polling_url=polling_url, message="Run already exists (idempotent).")
+        # Idempotency via correlation key
+        with session_scope() as session:
+            existing_run = repo_find_run_by_correlation_key(session, payload.correlation_key) if payload.correlation_key else None
+            if existing_run:
+                polling_url = str(request.url_for("get_run_status", run_id=existing_run.run_id))
+                return CreateRunResponse(run=existing_run, polling_url=polling_url, message="Run already exists (idempotent).")
 
-        run_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc)
-        run_status = RunStatus(
-            run_id=run_id,
-            correlation_key=payload.correlation_key,
-            branch=payload.branch,
-            target_env=payload.target_env,
-            certification_types=list(payload.certification_types),
-            created_at=now,
-            last_updated=now,
-            status="queued",
-            attempts=[],
-            assets=[],
-        )
-        registry.store_run(run_status)
+            now = datetime.now(timezone.utc)
+            run = RunModel(
+                run_id=__import__("uuid").uuid4().hex,
+                correlation_key=payload.correlation_key,
+                branch=payload.branch,
+                target_env=payload.target_env,
+                certification_types=list(payload.certification_types),
+                created_at=now,
+                last_updated=now,
+                status="queued",
+            )
+            persisted = repo_create_or_get_run(session, run, payload.notification)
 
-        # Create attempt for the run
-        attempt = registry.create_attempt(run_id=run_id, types=payload.certification_types, correlation_key=payload.correlation_key)
+            # Create an initial attempt
+            attempt = repo_create_attempt(
+                session=session,
+                run_id=persisted.run_id,
+                types=payload.certification_types,
+                correlation_key=payload.correlation_key,
+            )
+
+        # Set executor and orchestrate outside transaction
         attempt.executor = resolve_executor(payload.certification_types)
-        registry.update_attempt(attempt)
 
-        # Execute async
         if payload.async_execution:
             assert background_tasks is not None
             background_tasks.add_task(
-                orchestrate_attempt,
+                orchestrate_attempt_db,
                 attempt.attempt_id,
                 payload.certification_types,
                 local_runner,
                 airflow,
-                registry,
                 payload.notification,
             )
         else:
-            await orchestrate_attempt(
+            await orchestrate_attempt_db(
                 attempt.attempt_id,
                 payload.certification_types,
                 local_runner,
                 airflow,
-                registry,
                 payload.notification,
             )
 
-        polling_url = str(request.url_for("get_run_status", run_id=run_id))
-        return CreateRunResponse(run=registry.get_run(run_id), polling_url=polling_url, message="Run created.")
+        with session_scope() as session:
+            run_status = repo_get_run(session, persisted.run_id)
+        polling_url = str(request.url_for("get_run_status", run_id=persisted.run_id))
+        return CreateRunResponse(run=run_status, polling_url=polling_url, message="Run created.")
 
     @app.get(
         "/runs",
@@ -137,8 +155,10 @@ def get_app() -> FastAPI:
     )
     # PUBLIC_INTERFACE
     def list_runs() -> ListRunsResponse:
-        """List all runs from the in-memory registry."""
-        return ListRunsResponse(runs=registry.list_runs())
+        """List all runs from the database."""
+        with session_scope() as session:
+            runs = repo_list_runs(session)
+            return ListRunsResponse(runs=runs)
 
     @app.get(
         "/runs/{run_id}",
@@ -149,11 +169,12 @@ def get_app() -> FastAPI:
     )
     # PUBLIC_INTERFACE
     def get_run_status(run_id: str = FPath(..., description="Run identifier")) -> RunStatus:
-        """Get current run status including attempts and assets."""
-        run = registry.get_run(run_id)
-        if not run:
-            raise HTTPException(status_code=404, detail="Run not found")
-        return run
+        """Get current run status including attempts and assets from DB."""
+        with session_scope() as session:
+            run = repo_get_run(session, run_id)
+            if not run:
+                raise HTTPException(status_code=404, detail="Run not found")
+            return run
 
     @app.post(
         "/runs/{run_id}/attempts",
@@ -170,42 +191,45 @@ def get_app() -> FastAPI:
         background_tasks: BackgroundTasks = None,
     ) -> AttemptStatus:
         """Create a new attempt for the given run and schedule execution."""
-        run = registry.get_run(run_id)
-        if not run:
-            raise HTTPException(status_code=404, detail="Run not found")
+        with session_scope() as session:
+            run = repo_get_run(session, run_id)
+            if not run:
+                raise HTTPException(status_code=404, detail="Run not found")
 
-        # Idempotency for attempts within this run via correlation_key
-        if payload.correlation_key:
-            exist = registry.find_attempt_by_correlation_key(run_id, payload.correlation_key)
-            if exist:
-                return exist
+            # Idempotency via correlation key
+            attempt = repo_create_attempt(
+                session=session,
+                run_id=run_id,
+                types=payload.certification_types,
+                correlation_key=payload.correlation_key,
+            )
 
-        attempt = registry.create_attempt(run_id=run_id, types=payload.certification_types, correlation_key=payload.correlation_key)
+        # Choose executor and orchestrate
         attempt.executor = resolve_executor(payload.certification_types)
-        registry.update_attempt(attempt)
 
         if payload.async_execution:
             assert background_tasks is not None
             background_tasks.add_task(
-                orchestrate_attempt,
+                orchestrate_attempt_db,
                 attempt.attempt_id,
                 payload.certification_types,
                 local_runner,
                 airflow,
-                registry,
                 payload.notification,
             )
         else:
-            await orchestrate_attempt(
+            await orchestrate_attempt_db(
                 attempt.attempt_id,
                 payload.certification_types,
                 local_runner,
                 airflow,
-                registry,
                 payload.notification,
             )
 
-        return registry.get_attempt(run_id, attempt.attempt_id)
+        with session_scope() as session:
+            fresh = repo_get_attempt(session, run_id, attempt.attempt_id)
+            assert fresh is not None
+            return fresh
 
     @app.get(
         "/runs/{run_id}/attempts/{attempt_id}",
@@ -219,11 +243,12 @@ def get_app() -> FastAPI:
         run_id: str = FPath(..., description="Run id"),
         attempt_id: str = FPath(..., description="Attempt id"),
     ) -> AttemptStatus:
-        """Return attempt status for given run and attempt ids."""
-        attempt = registry.get_attempt(run_id, attempt_id)
-        if not attempt:
-            raise HTTPException(status_code=404, detail="Attempt not found")
-        return attempt
+        """Return attempt status for given run and attempt ids from DB."""
+        with session_scope() as session:
+            attempt = repo_get_attempt(session, run_id, attempt_id)
+            if not attempt:
+                raise HTTPException(status_code=404, detail="Attempt not found")
+            return attempt
 
     # WebSocket usage help note (route)
     @app.get(
@@ -240,109 +265,7 @@ def get_app() -> FastAPI:
     return app
 
 
-# ==== Helpers, Registry, Runners, and Stubs ====
-
-class TaskRegistry:
-    """In-memory registry for runs and attempts for MVP; replace with DB in future."""
-    def __init__(self):
-        self._runs: Dict[str, Dict] = {}  # run_id -> RunStatus.model_dump()
-        self._attempts: Dict[str, Dict[str, Dict]] = {}  # run_id -> attempt_id -> AttemptStatus
-        self._run_by_ckey: Dict[str, str] = {}  # correlation -> run_id
-        self._attempt_by_ckey: Dict[str, str] = {}  # f"{run_id}:{ckey}" -> attempt_id
-
-    def store_run(self, run_status):
-        self._runs[run_status.run_id] = run_status.model_dump()
-        if run_status.correlation_key:
-            self._run_by_ckey[run_status.correlation_key] = run_status.run_id
-
-    def list_runs(self):
-        return [RunStatus(**r) for r in self._runs.values()]
-
-    def get_run(self, run_id: str):
-        r = self._runs.get(run_id)
-        if not r:
-            return None
-        # hydrate attempts
-        attempts = list(self._attempts.get(run_id, {}).values())
-        rs = RunStatus(**r)
-        rs.attempts = [AttemptStatus(**a) for a in attempts]
-        return rs
-
-    def update_run_status(self, run_id: str):
-        run = self.get_run(run_id)
-        if not run:
-            return
-        # aggregate from attempts
-        statuses = {a.status for a in run.attempts}
-        if "running" in statuses:
-            run.status = "running"
-        elif "failed" in statuses and "succeeded" in statuses:
-            run.status = "partial"
-        elif statuses == {"succeeded"}:
-            run.status = "succeeded"
-        elif statuses == {"failed"}:
-            run.status = "failed"
-        elif statuses == {"queued"}:
-            run.status = "queued"
-        else:
-            # default
-            if "failed" in statuses:
-                run.status = "partial"
-            elif "succeeded" in statuses:
-                run.status = "partial"
-        run.last_updated = datetime.now(timezone.utc)
-        # persist back
-        self._runs[run_id] = run.model_dump()
-
-    def create_attempt(self, run_id: str, types: List[str], correlation_key: Optional[str] = None):
-        attempt_id = str(uuid.uuid4())
-        attempt = AttemptStatus(
-            attempt_id=attempt_id,
-            run_id=run_id,
-            status="queued",
-            started_at=None,
-            finished_at=None,
-            message=None,
-            assets=[],
-            metrics={"requested_types": ",".join(types)},
-            executor="local",
-            correlation_key=correlation_key,
-        )
-        self._attempts.setdefault(run_id, {})[attempt_id] = attempt.model_dump()
-        if correlation_key:
-            self._attempt_by_ckey[f"{run_id}:{correlation_key}"] = attempt_id
-        self.update_run_status(run_id)
-        return AttemptStatus(**self._attempts[run_id][attempt_id])
-
-    def update_attempt(self, attempt: "AttemptStatus"):
-        self._attempts.setdefault(attempt.run_id, {})[attempt.attempt_id] = attempt.model_dump()
-        self.update_run_status(attempt.run_id)
-
-    def get_attempt(self, run_id: str, attempt_id: str):
-        a = self._attempts.get(run_id, {}).get(attempt_id)
-        if not a:
-            return None
-        return AttemptStatus(**a)
-
-    def list_attempts(self, run_id: str):
-        return [AttemptStatus(**a) for a in self._attempts.get(run_id, {}).values()]
-
-    def find_run_by_correlation_key(self, ckey: Optional[str]):
-        if not ckey:
-            return None
-        run_id = self._run_by_ckey.get(ckey)
-        if not run_id:
-            return None
-        return self.get_run(run_id)
-
-    def find_attempt_by_correlation_key(self, run_id: str, ckey: Optional[str]):
-        if not ckey:
-            return None
-        attempt_id = self._attempt_by_ckey.get(f"{run_id}:{ckey}")
-        if not attempt_id:
-            return None
-        return self.get_attempt(run_id, attempt_id)
-
+# ==== Helpers, Runners, and Stubs (unchanged) ====
 
 class LocalRunner:
     """Executes static analysis and unit tests locally and collects artifacts."""
@@ -372,7 +295,6 @@ class LocalRunner:
         paths = paths or ["."]
         artifact_dir = self._artifact_dir(attempt_id)
         log_file = artifact_dir / "pylint.log"
-        # Use python -m pip to ensure module availability context; fallback to pylint command if available
         cmd = [sys.executable, "-m", "pylint", *paths]
         rc = self._run_cmd(cmd, cwd=None, log_file=log_file)
         return {
@@ -422,7 +344,7 @@ class AirflowClientStub:
     async def trigger(self, dag_id: str, conf: Dict) -> Dict:
         """Trigger a DAG run (stub)."""
         # In MVP, simulate a DAG trigger and completion after delay.
-        run_id = f"sim-{uuid.uuid4()}"
+        run_id = f"sim-{__import__('uuid').uuid4()}"
         await asyncio.sleep(0.1)
         return {"dag_id": dag_id, "dag_run_id": run_id, "state": "queued", "conf": conf}
 
@@ -438,31 +360,32 @@ def resolve_executor(types: List[str]) -> Literal["local", "airflow"]:
     return "airflow" if any(t in airflow_types for t in types) else "local"
 
 
-async def orchestrate_attempt(
+async def orchestrate_attempt_db(
     attempt_id: str,
     types: List[str],
     local_runner: LocalRunner,
     airflow: AirflowClientStub,
-    registry: TaskRegistry,
     notification: Optional["NotificationTarget"],
 ):
-    """Core orchestration: dispatch to local or Airflow and aggregate assets."""
-    # locate attempt
-    run_id = None
-    attempt = None
-    # find attempt in registry
-    for r_id, attempts in registry._attempts.items():
-        if attempt_id in attempts:
-            run_id = r_id
-            attempt = registry.get_attempt(r_id, attempt_id)
-            break
-    if not attempt:
-        return
+    """Core orchestration using database persistence for attempt status and assets."""
+    # mark running
+    with session_scope() as session:
+        # Fetch directly to get run_id for status updates
+        from .models import Attempt as AttemptModel
+        a_model = session.get(AttemptModel, attempt_id)
+        if not a_model:
+            return
+        run_id = a_model.run_id
 
-    # update status to running
-    attempt.status = "running"
-    attempt.started_at = datetime.now(timezone.utc)
-    registry.update_attempt(attempt)
+        repo_update_attempt_status_and_assets(
+            session=session,
+            attempt_id=attempt_id,
+            status="running",
+            message=None,
+            started_at=datetime.now(timezone.utc),
+            finished_at=None,
+            assets=[],
+        )
 
     assets: List[Dict] = []
     messages: List[str] = []
@@ -491,7 +414,6 @@ async def orchestrate_attempt(
             trigger = await airflow.trigger(dag_id=dag_id, conf={"attempt_id": attempt_id})
             complete = await airflow.wait_for_completion(dag_id=dag_id, dag_run_id=trigger["dag_run_id"])
             # simulate artifact
-            # write a small log
             storage = local_runner._artifact_dir(attempt_id)
             af_log = storage / f"{t}_airflow.log"
             af_log.write_text(json.dumps({"trigger": trigger, "complete": complete}, indent=2))
@@ -501,28 +423,35 @@ async def orchestrate_attempt(
         # Determine final status
         failed_rc = any(isinstance(x, int) and x not in (0, None) for x in rc_accum)
         af_failed = any("state=failed" in m.lower() for m in messages)
-        if failed_rc or af_failed:
-            attempt.status = "failed"
-        else:
-            attempt.status = "succeeded"
+        final_status = "failed" if (failed_rc or af_failed) else "succeeded"
 
-        attempt.finished_at = datetime.now(timezone.utc)
-        attempt.message = "; ".join(messages)
-        attempt.assets = [AssetRef(**a) for a in assets]
-        registry.update_attempt(attempt)
+        with session_scope() as session:
+            repo_update_attempt_status_and_assets(
+                session=session,
+                attempt_id=attempt_id,
+                status=final_status,
+                message="; ".join(messages),
+                started_at=None,  # keep existing
+                finished_at=datetime.now(timezone.utc),
+                assets=[AssetRef(**a) for a in assets],
+            )
 
     except Exception as exc:
-        attempt.status = "failed"
-        attempt.finished_at = datetime.now(timezone.utc)
-        attempt.message = f"Execution error: {exc}"
-        registry.update_attempt(attempt)
+        with session_scope() as session:
+            repo_update_attempt_status_and_assets(
+                session=session,
+                attempt_id=attempt_id,
+                status="failed",
+                message=f"Execution error: {exc}",
+                started_at=None,
+                finished_at=datetime.now(timezone.utc),
+                assets=[],
+            )
 
-    # Update run aggregate
-    if run_id:
-        registry.update_run_status(run_id)
-
-    # Notifications (stub)
-    await maybe_notify(notification, attempt)
+    # Notifications
+    with session_scope() as session:
+        fresh = repo_get_attempt(session, run_id, attempt_id)
+    await maybe_notify(notification, fresh)
 
 
 async def maybe_notify(notification: Optional["NotificationTarget"], attempt_obj) -> None:
@@ -532,7 +461,6 @@ async def maybe_notify(notification: Optional["NotificationTarget"], attempt_obj
     url = notification.notification_url if isinstance(notification, NotificationTarget) else getattr(notification, "notification_url", None)
     if url:
         try:
-            # Lazy import httpx to avoid mandatory dependency during import time
             import httpx  # type: ignore
             payload = {
                 "attempt_id": attempt_obj.attempt_id,
@@ -545,99 +473,10 @@ async def maybe_notify(notification: Optional["NotificationTarget"], attempt_obj
             async with httpx.AsyncClient(timeout=5.0) as client:
                 await client.post(str(url), json=payload)
         except Exception:
-            # swallow in MVP
             pass
-    # email stub intentionally omitted
 
 
 # Create application instance for ASGI
-# ==== Pydantic Models (module-level to avoid forward reference issues) ====
-
-class AssetRef(BaseModel):
-    name: str = Field(..., description="Logical name of the asset/log/report")
-    path: str = Field(..., description="Local path or storage URI")
-    content_type: Optional[str] = Field(None, description="MIME type if known")
-    size_bytes: Optional[int] = Field(None, description="Size in bytes if known")
-
-
-class AttemptStatus(BaseModel):
-    attempt_id: str
-    run_id: str
-    status: Literal["queued", "running", "succeeded", "failed", "canceled"]
-    started_at: Optional[datetime] = None
-    finished_at: Optional[datetime] = None
-    message: Optional[str] = None
-    assets: List[AssetRef] = Field(default_factory=list)
-    metrics: Dict[str, Union[int, float, str]] = Field(default_factory=dict)
-    executor: Literal["local", "airflow"] = "local"
-    correlation_key: Optional[str] = None
-
-
-class RunStatus(BaseModel):
-    run_id: str
-    correlation_key: Optional[str] = None
-    branch: Optional[str] = None
-    target_env: Optional[str] = None
-    certification_types: List[str] = Field(default_factory=list)
-    created_at: datetime
-    last_updated: datetime
-    status: Literal["queued", "running", "succeeded", "failed", "partial"]
-    attempts: List[AttemptStatus] = Field(default_factory=list)
-    assets: List[AssetRef] = Field(default_factory=list)
-
-
-class NotificationTarget(BaseModel):
-    notification_url: Optional[HttpUrl] = Field(
-        None, description="Webhook to be called upon status change."
-    )
-    notification_email: Optional[EmailStr] = Field(
-        None, description="Email address to notify (no-op stub)."
-    )
-
-
-class CreateRunRequest(BaseModel):
-    correlation_key: Optional[str] = Field(
-        None, description="Idempotency key to deduplicate run creation."
-    )
-    branch: Optional[str] = Field(None, description="SCM branch for mapping.")
-    target_env: Optional[str] = Field(None, description="Target environment.")
-    certification_types: List[
-        Literal["pylint", "bandit", "pytest", "e2e", "performance", "soak"]
-    ] = Field(..., description="Types of certifications to execute.")
-    async_execution: bool = Field(
-        True, description="Return immediately and allow polling for status."
-    )
-    notification: Optional[NotificationTarget] = Field(
-        None, description="Optional notification destinations."
-    )
-    extra: Dict[str, Union[str, int, float, bool]] = Field(
-        default_factory=dict, description="Additional parameters."
-    )
-
-
-class CreateRunResponse(BaseModel):
-    run: RunStatus
-    polling_url: Optional[HttpUrl] = None
-    message: str
-
-
-class CreateAttemptRequest(BaseModel):
-    correlation_key: Optional[str] = Field(
-        None, description="Idempotency key to deduplicate attempt creation."
-    )
-    certification_types: List[
-        Literal["pylint", "bandit", "pytest", "e2e", "performance", "soak"]
-    ] = Field(..., description="Types of certifications to execute for this attempt.")
-    async_execution: bool = True
-    notification: Optional[NotificationTarget] = None
-    extra: Dict[str, Union[str, int, float, bool]] = Field(default_factory=dict)
-
-
-class ListRunsResponse(BaseModel):
-    runs: List[RunStatus]
-
-
-# Rebuild app after model definitions
 app = get_app()
 
 if __name__ == "__main__":

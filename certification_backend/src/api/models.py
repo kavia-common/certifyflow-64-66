@@ -4,7 +4,6 @@ from datetime import datetime
 from typing import List, Optional
 
 from sqlalchemy import (
-    Column,
     String,
     DateTime,
     Enum,
